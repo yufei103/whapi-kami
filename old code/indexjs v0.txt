@@ -1,0 +1,381 @@
+import { app, shell, BrowserWindow, ipcMain, dialog, protocol, net } from 'electron' // 🔥 补全了 protocol, net
+import { join } from 'path'
+import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import icon from '../../resources/icon.png?asset'
+import fs from 'fs'
+import pino from 'pino'
+import QRCode from 'qrcode'
+import { pathToFileURL } from 'url' // 🔥 补全了这一行，用于处理文件路径
+
+// === Baileys 兼容性导入 ===
+import * as Baileys from '@whiskeysockets/baileys'
+const { 
+    useMultiFileAuthState, 
+    DisconnectReason, 
+    Browsers, 
+    delay 
+} = Baileys
+const makeWASocket = Baileys.default?.default || Baileys.default || Baileys
+
+let mainWindow
+let sock
+
+// === 📂 数据库路径 ===
+const USER_DATA_PATH = app.getPath('userData')
+const DB_FILE = join(USER_DATA_PATH, 'whapi_database.json')
+const DB_TEMP_FILE = join(USER_DATA_PATH, 'whapi_database.temp.json')
+const AUTH_FOLDER = join(USER_DATA_PATH, 'auth_info_baileys')
+
+if (!fs.existsSync(AUTH_FOLDER)) {
+    fs.mkdirSync(AUTH_FOLDER, { recursive: true })
+}
+
+let db = { labels: {}, labelMembers: {}, contacts: {}, chats: {} }
+if (fs.existsSync(DB_FILE)) { try { db = JSON.parse(fs.readFileSync(DB_FILE)); } catch (e) {} }
+
+// === 💾 异步保存 ===
+let saveTimeout
+let isSaving = false
+async function saveDb() {
+    if (saveTimeout) clearTimeout(saveTimeout)
+    saveTimeout = setTimeout(async () => {
+        if (isSaving) return 
+        isSaving = true
+        try {
+            const jsonStr = JSON.stringify(db, null, 2)
+            await fs.promises.writeFile(DB_TEMP_FILE, jsonStr)
+            await fs.promises.rename(DB_TEMP_FILE, DB_FILE)
+        } catch (err) { console.error('[DB] Save error:', err.message) } 
+        finally { isSaving = false }
+    }, 2000) 
+}
+
+// === 🔍 辅助函数 ===
+function isRealUserMessage(msg) {
+    if (!msg.message) return false
+    if (msg.key.fromMe) return false
+    if (msg.key.remoteJid === 'status@broadcast') return false
+    let content = msg.message
+    const wrapperKeys = ['ephemeralMessage', 'viewOnceMessage', 'viewOnceMessageV2', 'documentWithCaptionMessage', 'messageContextInfo', 'editedMessage']
+    for (const key of wrapperKeys) {
+        if (content[key] && content[key].message) content = content[key].message
+    }
+    const validTypes = ['conversation', 'extendedTextMessage', 'imageMessage', 'videoMessage', 'audioMessage', 'stickerMessage', 'documentMessage', 'contactMessage']
+    return validTypes.some(k => content[k])
+}
+
+function getMsgTimestamp(msg) {
+    let ts = msg.messageTimestamp
+    if (typeof ts === 'object' && ts !== null) ts = ts.low || ts
+    return Number(ts)
+}
+
+function sendToWindow(channel, data) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(channel, data)
+    }
+}
+
+// === IPC 接口 ===
+ipcMain.handle('get-db', () => db) 
+
+ipcMain.handle('select-file', async (event, type) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return null
+    let filters = []
+    if (type === 'image') filters = [{ name: 'Images', extensions: ['jpg', 'png', 'jpeg'] }]
+    else if (type === 'video') filters = [{ name: 'Videos', extensions: ['mp4'] }]
+    else filters = [{ name: 'Audio', extensions: ['mp3', 'ogg', 'mp4'] }]
+    const result = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'], filters: filters })
+    return (result.canceled || result.filePaths.length === 0) ? null : result.filePaths[0]
+})
+
+// === 🔥 核心逻辑：关联 LID 和 PN ===
+const updateContactLid = (pnJid, lidJid) => {
+    if (!pnJid || !lidJid) return
+    if (!pnJid.includes('@s.whatsapp.net')) return 
+    if (!lidJid.includes('@lid')) return          
+
+    if (!db.contacts[pnJid]) db.contacts[pnJid] = { name: null, notify: null, verifiedName: null, lid: null }
+    
+    if (db.contacts[pnJid].lid !== lidJid) {
+        db.contacts[pnJid].lid = lidJid
+        console.log(`🔗 [Link] ${pnJid.split('@')[0]} <==> LID`)
+        saveDb()
+    }
+}
+
+// === 🟢 WHATSAPP ENGINE ===
+async function startWhatsApp() {
+    if (sock) {
+        try { sock.ev.removeAllListeners(); sock.end(undefined); sock = null; } catch (e) { }
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER)
+
+    sock = makeWASocket({
+        logger: pino({ level: 'silent' }), 
+        auth: state,
+        syncFullHistory: true, 
+        browser: Browsers.windows('Desktop'),
+        connectTimeoutMs: 60000, 
+        retryRequestDelayMs: 5000,
+        getMessage: async () => { return { conversation: 'hello' } }
+    })
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update
+        if (qr) {
+            QRCode.toDataURL(qr, (err, url) => {
+                if (!err) sendToWindow('qr-code', url)
+            })
+        }
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut
+            if (shouldReconnect) setTimeout(startWhatsApp, 3000)
+        } else if (connection === 'open') {
+            console.log('[System] ✅ WhatsApp Connected!')
+            sendToWindow('status', 'connected')
+        }
+    })
+
+    sock.ev.on('creds.update', saveCreds)
+
+    const handleContacts = (contacts) => {
+        contacts.forEach(c => {
+            const id = c.id
+            const old = db.contacts[id] || {}
+            db.contacts[id] = {
+                name: c.name || old.name || null,
+                notify: c.notify || old.notify || null,
+                verifiedName: c.verifiedName || old.verifiedName || null,
+                lid: c.lid || old.lid || null
+            }
+        })
+        saveDb()
+    }
+
+    sock.ev.on('messaging-history.set', (data) => {
+        const { contacts, chats, messages } = data
+        if (contacts) handleContacts(contacts)
+        
+        if (chats) {
+            chats.forEach(c => {
+                const safeChat = {
+                    id: c.id, name: c.name, notify: c.notify, unreadCount: c.unreadCount,
+                    readOnly: c.readOnly, conversationTimestamp: c.conversationTimestamp 
+                }
+                
+                if (!db.chats[c.id]) {
+                    db.chats[c.id] = safeChat; db.chats[c.id].lastMessageRecvTimestamp = 0
+                } else {
+                    const { lastMessageRecvTimestamp, ...updateData } = safeChat
+                    Object.assign(db.chats[c.id], updateData)
+                }
+
+                if (c.lid) updateContactLid(c.id, c.lid)
+            })
+        }
+
+        if (messages) {
+            messages.forEach(msg => {
+                const jid = msg.key.remoteJid
+                if (!db.chats[jid]) db.chats[jid] = { id: jid }
+                const ts = getMsgTimestamp(msg)
+                
+                const currentLast = db.chats[jid].conversationTimestamp || 0
+                if (ts > currentLast) {
+                    db.chats[jid].conversationTimestamp = ts
+                    db.chats[jid].lastMessage = msg
+                }
+                if (isRealUserMessage(msg)) {
+                    const currentRecv = db.chats[jid].lastMessageRecvTimestamp || 0
+                    if (ts > currentRecv) db.chats[jid].lastMessageRecvTimestamp = ts
+                }
+            })
+        }
+        saveDb()
+        sendToWindow('db-updated', true)
+    })
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify' && type !== 'append') return
+        let needsSave = false
+        for (const msg of messages) {
+            const jid = msg.key.remoteJid
+            if (!db.chats[jid]) db.chats[jid] = { id: jid }
+            const ts = getMsgTimestamp(msg)
+            
+            db.chats[jid].conversationTimestamp = ts
+            db.chats[jid].lastMessage = msg
+            
+            if (isRealUserMessage(msg)) {
+                db.chats[jid].lastMessageRecvTimestamp = ts
+                console.log(`[Active] ${jid.split('@')[0]}`)
+                needsSave = true
+            }
+        }
+        if (needsSave) {
+            saveDb()
+            sendToWindow('db-updated', true)
+        }
+    })
+
+    sock.ev.on('contacts.upsert', handleContacts)
+    
+    sock.ev.on('contacts.update', (updates) => {
+        updates.forEach(u => {
+            if (db.contacts[u.id]) {
+                if (u.lid) db.contacts[u.id].lid = u.lid
+                if (u.name) db.contacts[u.id].name = u.name
+                if (u.notify) db.contacts[u.id].notify = u.notify
+            }
+        })
+        saveDb()
+    })
+
+    sock.ev.on('chats.upsert', (chats) => {
+        chats.forEach(c => { if (c.lid) updateContactLid(c.id, c.lid) })
+    })
+    sock.ev.on('chats.update', (updates) => {
+        updates.forEach(c => { if (c.lid) updateContactLid(c.id, c.lid) })
+    })
+
+    sock.ev.on('labels.edit', (l) => { if(l.id){ db.labels[l.id] = l.name; saveDb() }})
+    sock.ev.on('labels.association', (event) => {
+        const events = Array.isArray(event) ? event : [event]
+        events.forEach(e => {
+            if (e.association?.type === 'label_jid') {
+                const { labelId, chatId } = e.association
+                if (!db.labelMembers[labelId]) db.labelMembers[labelId] = []
+                
+                if (e.type === 'add') {
+                    if (!db.labelMembers[labelId].includes(chatId)) db.labelMembers[labelId].push(chatId)
+                } else if (e.type === 'remove') {
+                    db.labelMembers[labelId] = db.labelMembers[labelId].filter(id => id !== chatId)
+                }
+            }
+        })
+        saveDb()
+    })
+}
+
+// === Helpers ===
+function processSpintax(text) {
+    if (!text) return ""
+    return text.replace(/\{([^{}]+)\}/g, (match, content) => {
+        const choices = content.split('|')
+        return choices[Math.floor(Math.random() * choices.length)]
+    })
+}
+
+function processVariables(text, contactName, contactNumber) {
+    if (!text) return ""
+    let processed = text
+    const safeName = contactName || "Friend" 
+    processed = processed.replace(/\{{1,2}name\}{1,2}/gi, safeName)
+    return processed
+}
+
+function getRandomDelay(min, max) {
+    const minMs = min * 1000
+    const maxMs = max * 1000
+    return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs
+}
+
+// === 发送逻辑 ===
+ipcMain.handle('send-flow', async (event, { jid, contactName, flow, delaySettings }) => {
+    try {
+        console.log(`[Task] Sending to: ${jid}`)
+        let targetJid = jid
+        try {
+            if (jid.includes('@s.whatsapp.net')) {
+                const [result] = await sock.onWhatsApp(jid) 
+                if (result && result.exists) targetJid = result.jid
+            }
+        } catch (err) { }
+
+        const d = delaySettings || {}
+        
+        for (const msg of flow) {
+            const thinkTime = getRandomDelay(d.msgMin || 1, d.msgMax || 3)
+            await delay(thinkTime)
+
+            if (msg.type === 'text') {
+                await sock.sendPresenceUpdate('composing', targetJid)
+                const typingTime = getRandomDelay(d.typeMin || 0.5, d.typeMax || 1.5)
+                await delay(typingTime) 
+                await sock.sendPresenceUpdate('paused', targetJid) 
+                
+                let finalBody = processSpintax(msg.content)
+                finalBody = processVariables(finalBody, contactName, targetJid)
+                await sock.sendMessage(targetJid, { text: finalBody })
+            } 
+            else if (msg.type === 'image' || msg.type === 'video') {
+                if (!msg.path || !fs.existsSync(msg.path)) continue 
+                
+                await sock.sendPresenceUpdate('composing', targetJid)
+                const mediaTime = getRandomDelay(d.mediaMin || 1, d.mediaMax || 3)
+                await delay(mediaTime)
+                await sock.sendPresenceUpdate('paused', targetJid)
+
+                let finalCaption = ""
+                if (msg.content) { 
+                    finalCaption = processSpintax(msg.content)
+                    finalCaption = processVariables(finalCaption, contactName, targetJid)
+                }
+                const buffer = fs.readFileSync(msg.path)
+                
+                if (msg.type === 'image') {
+                    await sock.sendMessage(targetJid, { image: buffer, caption: finalCaption, mimetype: 'image/jpeg' })
+                } else {
+                    await sock.sendMessage(targetJid, { video: buffer, caption: finalCaption, mimetype: 'video/mp4' })
+                }
+            }
+            else if (msg.type === 'audio') {
+                if (fs.existsSync(msg.path)) {
+                    const recTime = getRandomDelay(d.recMin || 2, d.recMax || 5)
+                    await sock.sendPresenceUpdate('recording', targetJid) 
+                    await delay(recTime)
+                    await sock.sendPresenceUpdate('paused', targetJid)
+
+                    const buffer = fs.readFileSync(msg.path)
+                    await sock.sendMessage(targetJid, { audio: buffer, ptt: true, mimetype: 'audio/mp4' })
+                }
+            }
+        }
+        return { success: true }
+    } catch (error) {
+        return { success: false, error: error.message }
+    }
+})
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1200, height: 900, show: false, autoHideMenuBar: true,
+    ...(process.platform === 'linux' ? { icon } : {}),
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: false, contextIsolation: true 
+    }
+  })
+  mainWindow.on('ready-to-show', () => { mainWindow.show(); startWhatsApp(); })
+  mainWindow.webContents.setWindowOpenHandler((details) => { shell.openExternal(details.url); return { action: 'deny' } })
+  if (is.dev && process.env['ELECTRON_RENDERER_URL']) mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+  else mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+}
+
+app.whenReady().then(() => {
+  electronApp.setAppUserModelId('com.whapi.app')
+
+  // 🔥🔥🔥 关键修复：注册 media:// 协议，让前端可以读取本地文件
+  protocol.handle('media', (request) => {
+    const filePath = request.url.slice('media://'.length)
+    return net.fetch(pathToFileURL(decodeURIComponent(filePath)).toString())
+  })
+
+  app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
+  createWindow()
+  app.on('activate', function () { if (BrowserWindow.getAllWindows().length === 0) createWindow() })
+})
+
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })

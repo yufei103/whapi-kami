@@ -1,0 +1,613 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react'
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Card, CardContent } from "@/components/ui/card"
+import { Checkbox } from "@/components/ui/checkbox"
+import { Textarea } from "@/components/ui/textarea"
+import { Slider } from "@/components/ui/slider"
+import { Badge } from "@/components/ui/badge"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { Command, CommandGroup, CommandItem, CommandList, CommandSeparator } from "@/components/ui/command"
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
+import { Loader2, Trash2, FileImage, FileVideo, Mic, Settings, Search, ChevronDown, ChevronUp, Check, Eye, Maximize2, User, X, ChevronLeft, ChevronRight } from "lucide-react"
+import { cn } from "@/lib/utils"
+
+// 默认设置
+const INITIAL_SETTINGS = {
+  typeMin: 0.5, typeMax: 1.5,
+  mediaMin: 1.0, mediaMax: 3.0,
+  recMin: 2.0, recMax: 5.0,
+  msgMin: 1.0, msgMax: 3.0,
+  userMin: 2.3, userMax: 3.8
+}
+
+// === 增强版多选组件 ===
+function MultiSelect({ title, options, selected, onChange, icon }) {
+  const [open, setOpen] = useState(false)
+  const allKeys = Object.keys(options || {})
+  
+  const handleSelect = (value) => {
+    const newSelected = new Set(selected)
+    if (newSelected.has(value)) newSelected.delete(value)
+    else newSelected.add(value)
+    onChange(Array.from(newSelected))
+  }
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button variant="outline" role="combobox" aria-expanded={open} className="w-full justify-between h-9 text-sm font-normal px-3 border-slate-300">
+          <div className="flex items-center gap-2 truncate text-slate-700">
+            {icon}
+            {selected.length === 0 ? `选择 ${title}` : 
+             selected.length === allKeys.length ? `全部 ${title}` :
+             `已选 ${selected.length} 项`}
+          </div>
+          <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[300px] p-0">
+        <Command>
+          <div className="flex items-center justify-between p-2 border-b bg-slate-100 sticky top-0 z-10">
+             <div className="flex items-center gap-1 cursor-pointer hover:bg-slate-200 px-2 py-1 rounded text-xs font-bold text-blue-600 transition-colors" onClick={() => onChange(allKeys)}>
+               <Check className="w-3 h-3" /> 全选
+             </div>
+             <div className="flex items-center gap-1 cursor-pointer hover:bg-slate-200 px-2 py-1 rounded text-xs font-bold text-red-500 transition-colors" onClick={() => onChange([])}>
+               <Trash2 className="w-3 h-3" /> 清除
+             </div>
+          </div>
+          <CommandList className="max-h-[200px] overflow-y-auto">
+            <CommandGroup>
+              {allKeys.map((key) => (
+                <CommandItem key={key} onSelect={() => handleSelect(key)}>
+                  <div className={cn("mr-2 flex h-4 w-4 items-center justify-center rounded-sm border border-primary", selected.includes(key) ? "bg-primary text-primary-foreground" : "opacity-50 [&_svg]:invisible")}>
+                    <Check className={cn("h-4 w-4")} />
+                  </div>
+                  <span className="truncate">{options[key]}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+function App() {
+  const [view, setView] = useState('login') 
+  const [qrCode, setQrCode] = useState('')
+  const [statusText, setStatusText] = useState('初始化...')
+  const [db, setDb] = useState({ labels: {}, labelMembers: {}, contacts: {}, chats: {} })
+  
+  const [contacts, setContacts] = useState([]) 
+  const [selectedJids, setSelectedJids] = useState(new Set())
+  
+  const [visibleCount, setVisibleCount] = useState(20) 
+  const listRef = useRef(null) 
+  
+  const [currentPage, setCurrentPage] = useState(1)
+  const PAGE_SIZE = 100 
+
+  const [filter, setFilter] = useState({
+    daysRule: 'off',
+    hasChat: true,
+    isContact: false,
+    labelSource: [], 
+    excludeLabel: [], 
+    dateStart: '', 
+    dateEnd: '',   
+    incKeys: '',
+    exKeys: '',
+    ack: 'any',
+    includeNums: '',
+    excludeNums: ''
+  })
+  
+  const [isFilterExpanded, setIsFilterExpanded] = useState(true)
+  const [isNumFilterExpanded, setIsNumFilterExpanded] = useState(false)
+  const [isResultExpanded, setIsResultExpanded] = useState(false)
+  const [showFullContactList, setShowFullContactList] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  const [previewFile, setPreviewFile] = useState(null)
+  const [previewType, setPreviewType] = useState('image')
+  
+  const [flowItems, setFlowItems] = useState([])
+  const [appSettings, setAppSettings] = useState(INITIAL_SETTINGS)
+  const [isSending, setIsSending] = useState(false)
+  const [sendProgress, setSendProgress] = useState({ current: 0, total: 0, targetName: '', timeLeft: 0 })
+
+  const etaText = useMemo(() => {
+    if (selectedJids.size === 0) return ''
+    if (flowItems.length === 0) return ''
+    let onePersonTime = appSettings.userMax
+    flowItems.forEach(item => {
+      onePersonTime += appSettings.msgMax 
+      if (item.type === 'text') onePersonTime += appSettings.typeMax
+      else if (item.type === 'image' || item.type === 'video') onePersonTime += appSettings.mediaMax
+      else if (item.type === 'audio') onePersonTime += appSettings.recMax
+    })
+    const totalSeconds = onePersonTime * selectedJids.size
+    if (totalSeconds < 60) return `${Math.ceil(totalSeconds)}秒`
+    if (totalSeconds < 3600) return `${Math.ceil(totalSeconds/60)}分钟`
+    return `${(totalSeconds/3600).toFixed(1)}小时`
+  }, [selectedJids.size, flowItems, appSettings])
+
+  useEffect(() => {
+    const ipc = window.electron.ipcRenderer
+    ipc.on('qr-code', (_, url) => { setQrCode(url); setStatusText('请扫描二维码') })
+    ipc.on('status', (_, status) => {
+      if (status === 'connected') {
+        setView('dashboard')
+        refreshDb()
+        const saved = localStorage.getItem('whapi_settings')
+        if (saved) setAppSettings(JSON.parse(saved))
+      }
+    })
+    ipc.on('db-updated', () => refreshDb())
+    refreshDb()
+    return () => { ipc.removeAllListeners('qr-code'); ipc.removeAllListeners('status'); ipc.removeAllListeners('db-updated') }
+  }, [])
+
+  const refreshDb = async () => {
+    try {
+      const data = await window.electron.ipcRenderer.invoke('get-db')
+      if (data && data.chats) setDb(data)
+    } catch (e) { console.error(e) }
+  }
+
+  const handleScroll = (e) => {
+    const bottom = e.target.scrollHeight - e.target.scrollTop <= e.target.clientHeight + 50
+    if (bottom && visibleCount < contacts.length) {
+      setVisibleCount(prev => Math.min(prev + 20, contacts.length))
+    }
+  }
+
+  useEffect(() => {
+    setVisibleCount(20)
+    setCurrentPage(1)
+  }, [contacts])
+
+  const resolveUserContext = (jid) => {
+    let pnJid = null, lidJid = null
+    if (jid.includes('@s.whatsapp.net')) {
+      pnJid = jid
+      if (db.contacts[pnJid]) lidJid = db.contacts[pnJid].lid
+    } else if (jid.includes('@lid')) {
+      lidJid = jid
+      for (const key in db.contacts) { if (db.contacts[key].lid === lidJid) { pnJid = key; break } }
+    }
+    let contact = (pnJid ? db.contacts[pnJid] : null) || (lidJid ? db.contacts[lidJid] : null) || {}
+    const chatPN = pnJid ? db.chats[pnJid] : null
+    const chatLID = lidJid ? db.chats[lidJid] : null
+    const t1 = chatPN?.lastMessageRecvTimestamp || 0
+    const t2 = chatLID?.lastMessageRecvTimestamp || 0
+    let bestChat = (t1 >= t2) ? chatPN : chatLID
+    if (!bestChat) bestChat = chatPN || chatLID || db.chats[jid]
+    const finalTarget = pnJid || jid
+    const displayName = contact.name || contact.verifiedName || contact.notify || finalTarget.split('@')[0]
+    return {
+      targetJid: finalTarget,
+      contact: contact,
+      chat: bestChat,
+      displayName: displayName,
+      isSaved: !!(contact.name || contact.verifiedName),
+      phone: finalTarget.split('@')[0]
+    }
+  }
+
+  const runFilter = () => {
+    if (!db || !db.chats) return
+    
+    const candidateMap = new Map()
+
+    if (filter.labelSource.length > 0) {
+      filter.labelSource.forEach(labelId => {
+        const members = db.labelMembers[labelId] || []
+        members.forEach(jid => {
+           const ctx = resolveUserContext(jid)
+           candidateMap.set(ctx.targetJid, ctx)
+        })
+      })
+    } else if (filter.labelSource.length === 0 && !filter.includeNums) {
+        Object.keys(db.chats).forEach(jid => {
+            const ctx = resolveUserContext(jid)
+            candidateMap.set(ctx.targetJid, ctx)
+        })
+    }
+
+    const incNums = filter.includeNums.replace(/[^0-9,\n]/g, '').split(/[,\n]+/).filter(x=>x)
+    if (incNums.length > 0) {
+        Object.keys(db.chats).forEach(jid => {
+            const ctx = resolveUserContext(jid)
+            if (incNums.includes(ctx.phone)) candidateMap.set(ctx.targetJid, ctx)
+        })
+    }
+
+    if (filter.excludeLabel.length > 0) {
+      filter.excludeLabel.forEach(labelId => {
+        const members = db.labelMembers[labelId] || []
+        members.forEach(jid => {
+            const ctx = resolveUserContext(jid)
+            candidateMap.delete(ctx.targetJid)
+        })
+      })
+    }
+
+    const excNums = filter.excludeNums.replace(/[^0-9,\n]/g, '').split(/[,\n]+/).filter(x=>x)
+    const incKeys = filter.incKeys.toLowerCase().split(/[ ,]+/).filter(x=>x)
+    const exKeys = filter.exKeys.toLowerCase().split(/[ ,]+/).filter(x=>x)
+    const now = Date.now()
+    const DAYS_160 = 160 * 24 * 60 * 60 * 1000
+    
+    const dateStartTs = filter.dateStart ? new Date(filter.dateStart).getTime() : 0
+    const dateEndTs = filter.dateEnd ? new Date(filter.dateEnd).getTime() : 9999999999999
+
+    const finalResults = []
+
+    for (let ctx of candidateMap.values()) {
+        const { chat, displayName, isSaved, targetJid, phone } = ctx
+
+        if (excNums.includes(phone)) continue
+        if (filter.hasChat && !chat) continue
+        if (filter.isContact && !isSaved) continue
+
+        const lowerName = displayName.toLowerCase()
+        if (exKeys.some(k => lowerName.includes(k))) continue
+        if (incKeys.length > 0 && !incKeys.some(k => lowerName.includes(k))) continue
+
+        // 统一时间获取逻辑 (双重保险)
+        // 1. 尝试取 conversationTimestamp (最后对话时间)
+        // 2. 如果没有，取 lastMessageRecvTimestamp (最后接收时间)
+        // 3. 注意：WhatsApp 有时返回秒，有时毫秒。通常 < 10000000000 视为秒，需要 * 1000
+        let rawTime = chat?.conversationTimestamp || chat?.lastMessageRecvTimestamp || 0
+        if (typeof rawTime === 'object') rawTime = rawTime.low || 0 // 处理 Long 对象
+        let lastTime = Number(rawTime)
+        if (lastTime > 0 && lastTime < 10000000000) lastTime *= 1000 // 补全毫秒
+
+        const replied = lastTime > 0
+        const diff = now - lastTime
+        const isWithin160 = replied && (diff < DAYS_160)
+
+        if (filter.daysRule === 'in' && !isWithin160) continue
+        if (filter.daysRule === 'out' && isWithin160) continue
+
+        // 🔥 修复后的时间范围筛选 (Range Filter)
+        // 只有当设定了时间，且 chat 有有效时间时才判断
+        if ((filter.dateStart || filter.dateEnd) && lastTime > 0) {
+            // "在此之后" (Start) <= 时间 <= "在此之前" (End)
+            if (lastTime < dateStartTs || lastTime > dateEndTs) continue
+        }
+
+        if (filter.ack !== 'any' && chat && chat.lastMessage && chat.lastMessage.key?.fromMe) {
+            const status = chat.lastMessage.status || 0
+            if (status < parseInt(filter.ack)) continue
+        }
+
+        finalResults.push({
+            jid: targetJid, name: displayName, phone,
+            hasReplied: replied, diff, lastReplyTime: lastTime, isSaved
+        })
+    }
+
+    setContacts(finalResults)
+    setSelectedJids(new Set(finalResults.map(c => c.jid)))
+    setIsResultExpanded(true)
+  }
+
+  const toggleContact = (jid) => {
+    const newSet = new Set(selectedJids)
+    if (newSet.has(jid)) newSet.delete(jid)
+    else newSet.add(jid)
+    setSelectedJids(newSet)
+  }
+  const toggleAllContacts = (checked) => {
+    if (checked) setSelectedJids(new Set(contacts.map(c => c.jid)))
+    else setSelectedJids(new Set())
+  }
+
+  const addFlowItem = (type) => setFlowItems([...flowItems, { id: Date.now(), type, content: '', path: '' }])
+  const removeFlowItem = (id) => setFlowItems(flowItems.filter(i => i.id !== id))
+  const updateFlowItem = (id, key, value) => setFlowItems(flowItems.map(i => i.id === id ? { ...i, [key]: value } : i))
+  const selectFile = async (id, type) => {
+    const path = await window.electron.ipcRenderer.invoke('select-file', type)
+    if (path) updateFlowItem(id, 'path', path)
+  }
+
+  const handlePreview = (item) => {
+    if (!item.path) return
+    setPreviewType(item.type)
+    setPreviewFile(`media://${item.path.replace(/\\/g, '/')}`) 
+  }
+
+  const startSend = async () => {
+    if (selectedJids.size === 0) return alert('请先选择发送对象')
+    if (flowItems.length === 0) return alert('请先添加发送内容')
+    if (!confirm(`确定发送给 ${selectedJids.size} 人？`)) return
+
+    setIsSending(true)
+    const targets = contacts.filter(c => selectedJids.has(c.jid))
+    const totalMaxTime = targets.length * (appSettings.userMax + flowItems.length * 3)
+    setSendProgress({ current: 0, total: targets.length, targetName: '初始化...', timeLeft: totalMaxTime })
+
+    const timer = setInterval(() => { setSendProgress(p => ({ ...p, timeLeft: Math.max(0, p.timeLeft - 1) })) }, 1000)
+
+    for (let i = 0; i < targets.length; i++) {
+      const target = targets[i]
+      setSendProgress(prev => ({ ...prev, current: i + 1, targetName: target.name }))
+      try {
+        await window.electron.ipcRenderer.invoke('send-flow', {
+          jid: target.jid, contactName: target.name, flow: flowItems, delaySettings: appSettings
+        })
+      } catch (e) { console.error(e) }
+      if (i < targets.length - 1) {
+        const delay = Math.floor(Math.random() * ((appSettings.userMax - appSettings.userMin) * 1000)) + (appSettings.userMin * 1000)
+        await new Promise(r => setTimeout(r, delay))
+      }
+    }
+    clearInterval(timer)
+    setIsSending(false)
+    alert('发送任务完成！')
+  }
+
+  const paginatedContacts = useMemo(() => {
+    const start = (currentPage - 1) * PAGE_SIZE
+    return contacts.slice(start, start + PAGE_SIZE)
+  }, [contacts, currentPage])
+
+  const totalPages = Math.ceil(contacts.length / PAGE_SIZE)
+
+  const ContactRow = ({ c }) => (
+    <div className="flex items-center p-3 hover:bg-slate-50 transition-colors cursor-pointer border-b border-gray-50" onClick={() => toggleContact(c.jid)}>
+        <Checkbox checked={selectedJids.has(c.jid)} onClick={(e) => e.stopPropagation()} onCheckedChange={() => toggleContact(c.jid)} />
+        <div className="ml-3 overflow-hidden flex-1">
+            <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-gray-800 truncate">{c.name}</span>
+                {c.isSaved && <Badge variant="default" className="text-[10px] h-4 bg-blue-600 hover:bg-blue-700 px-1">好友</Badge>}
+            </div>
+            <div className="flex items-center gap-2 mt-1">
+                <span className="text-xs text-gray-400">{c.phone}</span>
+                {c.hasReplied ? <Badge variant="outline" className="text-[10px] bg-emerald-50 text-emerald-600 border-emerald-200 px-1">回覆 {Math.floor(c.diff/86400000)}天</Badge> : <Badge variant="outline" className="text-[10px] bg-red-50 text-red-600 border-red-200 px-1">无回覆</Badge>}
+            </div>
+        </div>
+    </div>
+  )
+
+  if (view === 'login') return (
+    <div className="flex flex-col items-center justify-center h-screen bg-gray-50">
+      <Card className="w-[400px] text-center p-6 shadow-xl"><h1 className="text-2xl font-bold mb-4 text-gray-800">🤖 扫码连接</h1><div className="flex justify-center my-6">{qrCode ? <img src={qrCode} className="w-64 h-64 border-8 border-white shadow-sm" alt="QR" /> : <div className="w-64 h-64 bg-gray-200 flex items-center justify-center rounded-lg animate-pulse"><Loader2 className="w-10 h-10 animate-spin text-gray-400" /></div>}</div><p className="text-gray-500 font-medium">{statusText}</p></Card>
+    </div>
+  )
+
+  return (
+    <div className="flex flex-col h-screen bg-slate-50 text-slate-900 overflow-hidden font-sans">
+      <div className="bg-white border-b border-gray-200 flex-shrink-0">
+        <div className="px-4 py-3 bg-slate-100 cursor-pointer flex justify-between items-center select-none hover:bg-slate-200 transition-colors" onClick={() => setIsFilterExpanded(!isFilterExpanded)}>
+          <div className="font-bold flex items-center gap-2 text-sm text-slate-700"><Search className="w-4 h-4" /> 筛选条件 (Filters)</div>
+          {isFilterExpanded ? <ChevronUp className="w-4 h-4 text-gray-500"/> : <ChevronDown className="w-4 h-4 text-gray-500"/>}
+        </div>
+
+        {isFilterExpanded && (
+          <div className="p-4 space-y-4 animate-in slide-in-from-top-2 duration-200">
+            <div className="flex flex-wrap gap-4 bg-blue-50/50 p-3 rounded-lg border border-blue-100">
+              <label className="flex items-center gap-2 text-sm font-semibold cursor-pointer"><input type="radio" name="days" checked={filter.daysRule === 'off'} onChange={() => setFilter({...filter, daysRule: 'off'})} className="accent-blue-600" /> 无日期限制</label>
+              <label className="flex items-center gap-2 text-sm font-semibold cursor-pointer"><input type="radio" name="days" checked={filter.daysRule === 'in'} onChange={() => setFilter({...filter, daysRule: 'in'})} className="accent-blue-600" /> 📅 160天内</label>
+              <label className="flex items-center gap-2 text-sm font-semibold cursor-pointer"><input type="radio" name="days" checked={filter.daysRule === 'out'} onChange={() => setFilter({...filter, daysRule: 'out'})} className="accent-blue-600" /> 🥶 160天外</label>
+              <div className="w-px h-5 bg-blue-200 mx-2"></div>
+              <div className="flex items-center gap-2"><Checkbox id="chat" checked={filter.hasChat} onCheckedChange={(c) => setFilter({...filter, hasChat: c})} /><label htmlFor="chat" className="text-sm font-medium">必须有对话</label></div>
+              <div className="flex items-center gap-2"><Checkbox id="contact" checked={filter.isContact} onCheckedChange={(c) => setFilter({...filter, isContact: c})} /><label htmlFor="contact" className="text-sm font-medium">必须是好友</label></div>
+            </div>
+
+            <div className="grid grid-cols-4 gap-4">
+              <div className="space-y-1"><label className="text-xs font-bold text-gray-500">🏷️ Label (包含)</label><MultiSelect title="Labels" options={db.labels} selected={filter.labelSource} onChange={(val) => setFilter({...filter, labelSource: val})} icon={<div className="w-2 h-2 rounded-full bg-emerald-500 mr-2" />} /></div>
+              <div className="space-y-1"><label className="text-xs font-bold text-gray-500">🚫 Exclude Label (排除)</label><MultiSelect title="排除标签" options={db.labels} selected={filter.excludeLabel} onChange={(val) => setFilter({...filter, excludeLabel: val})} icon={<div className="w-2 h-2 rounded-full bg-red-500 mr-2" />} /></div>
+              <div className="col-span-2 space-y-1">
+                <label className="text-xs font-bold text-gray-500">🕒 最后信息时间 (Conversation Range)</label>
+                {/* 🔥 修复：日期UI 改为左右布局，文字清晰 */}
+                <div className="flex gap-4 items-center">
+                  <div className="flex-1 flex flex-col gap-1">
+                    <span className="text-[10px] font-bold text-emerald-600">起始时间 (Start/After)</span>
+                    <Input 
+                        type="datetime-local" 
+                        className={`h-9 text-xs ${filter.dateStart ? 'border-emerald-500 bg-emerald-50' : ''}`} 
+                        value={filter.dateStart} 
+                        onChange={e=>setFilter({...filter, dateStart:e.target.value})} 
+                    />
+                  </div>
+                  <span className="text-gray-400 self-end mb-2">➡</span>
+                  <div className="flex-1 flex flex-col gap-1">
+                    <span className="text-[10px] font-bold text-red-600">结束时间 (End/Before)</span>
+                    <Input 
+                        type="datetime-local" 
+                        className={`h-9 text-xs ${filter.dateEnd ? 'border-red-500 bg-red-50' : ''}`} 
+                        value={filter.dateEnd} 
+                        onChange={e=>setFilter({...filter, dateEnd:e.target.value})} 
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-4 gap-4">
+               <div className="space-y-1"><label className="text-xs font-bold text-gray-500">🔍 包含关键词</label><Input className="h-9" placeholder="阿明 or 26/1/26" value={filter.incKeys} onChange={e=>setFilter({...filter, incKeys:e.target.value})} /></div>
+               <div className="space-y-1"><label className="text-xs font-bold text-gray-500">🚫 排除关键词</label><Input className="h-9" placeholder="Block or 变态" value={filter.exKeys} onChange={e=>setFilter({...filter, exKeys:e.target.value})} /></div>
+               <div className="space-y-1"><label className="text-xs font-bold text-gray-500">✅ 消息状态</label><select className="w-full h-9 px-3 py-1 text-sm border rounded-md bg-white" onChange={e=>setFilter({...filter, ack:e.target.value})} value={filter.ack}><option value="any">不限</option><option value="3">已读</option></select></div>
+            </div>
+            
+            <div className="text-xs text-blue-600 font-semibold cursor-pointer hover:underline" onClick={() => setIsNumFilterExpanded(!isNumFilterExpanded)}>{isNumFilterExpanded ? "🔼 收起号码过滤器" : "🔽 展开号码过滤器"}</div>
+            {isNumFilterExpanded && (
+              <div className="grid grid-cols-2 gap-4 pt-2">
+                <div><label className="text-xs font-bold text-emerald-600">✅ 指定发送名单 (粘贴)</label><Textarea className="h-16 mt-1 text-xs font-mono" placeholder="60123456789（Enter换行）" value={filter.includeNums} onChange={e=>setFilter({...filter, includeNums:e.target.value})} /></div>
+                <div><label className="text-xs font-bold text-red-600">🚫 排除号码名单 (粘贴)</label><Textarea className="h-16 mt-1 text-xs font-mono" placeholder="60123456789 (Enter换行)" value={filter.excludeNums} onChange={e=>setFilter({...filter, excludeNums:e.target.value})} /></div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="flex-1 flex overflow-hidden bg-slate-50 p-3 gap-3">
+        {/* 🔥 侧边栏加宽至 w-32 (128px) */}
+        <div className={`bg-white border rounded-lg shadow-sm flex flex-col transition-all duration-300 ${isResultExpanded ? 'w-[400px]' : 'w-32'}`}>
+          <div className="p-3 bg-emerald-50 border-b flex justify-between items-center cursor-pointer hover:bg-emerald-100 transition-colors h-10" onClick={() => setIsResultExpanded(!isResultExpanded)}>
+             {isResultExpanded ? (
+               <div className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
+                  <Checkbox checked={selectedJids.size > 0 && selectedJids.size === contacts.length} onCheckedChange={toggleAllContacts} />
+                  <span className="text-xs font-bold text-emerald-800 truncate">已选 {selectedJids.size} / {contacts.length}</span>
+               </div>
+             ) : (
+                <div className="w-full flex justify-center items-center gap-1">
+                    <User className="w-4 h-4 text-emerald-600"/>
+                    <span className="text-[10px] font-bold text-emerald-700">{selectedJids.size}选</span>
+                </div>
+             )}
+             <div className="flex items-center gap-1">
+                {isResultExpanded && <Maximize2 className="w-4 h-4 text-gray-400 hover:text-blue-600" onClick={(e) => { e.stopPropagation(); setShowFullContactList(true) }} />}
+                {isResultExpanded ? <div className="text-xs text-gray-500">收起</div> : null}
+             </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-0" onScroll={handleScroll} ref={listRef}>
+             {isResultExpanded ? (
+                contacts.length === 0 ? <div className="text-center text-gray-400 text-sm mt-10">无数据</div> : (
+                  <div className="divide-y divide-gray-100">
+                    {contacts.slice(0, visibleCount).map((c) => <ContactRow key={c.jid} c={c} />)}
+                    {visibleCount < contacts.length && <div className="p-2 text-center text-xs text-gray-400">加载更多...</div>}
+                  </div>
+                )
+             ) : (
+                <div className="flex flex-col items-center py-2 gap-3">
+                   {contacts.slice(0, visibleCount).map(c => (
+                      <div key={c.jid} className="flex flex-col items-center gap-1 w-full px-1 border-b border-dashed border-gray-100 pb-2">
+                         <div className={`w-3 h-3 rounded-full ${selectedJids.has(c.jid) ? 'bg-emerald-500' : 'bg-gray-300'}`}></div>
+                         <span className="text-[10px] text-gray-600 truncate w-full text-center leading-tight">{c.name.slice(0,6)}..</span>
+                      </div>
+                   ))}
+                </div>
+             )}
+          </div>
+        </div>
+
+        <div className="flex-1 bg-white border rounded-lg shadow-sm flex flex-col overflow-hidden">
+          <div className="p-3 border-b flex flex-wrap gap-2 items-center bg-gray-50/50">
+             <Button variant="outline" size="sm" className="h-8 gap-1 text-emerald-600 border-emerald-200 hover:bg-emerald-50" onClick={() => addFlowItem('text')}><span className="text-lg">📝</span> 文字</Button>
+             <Button variant="outline" size="sm" className="h-8 gap-1 text-emerald-600 border-emerald-200 hover:bg-emerald-50" onClick={() => addFlowItem('image')}><FileImage className="w-4 h-4" /> 图片</Button>
+             <Button variant="outline" size="sm" className="h-8 gap-1 text-emerald-600 border-emerald-200 hover:bg-emerald-50" onClick={() => addFlowItem('video')}><FileVideo className="w-4 h-4" /> 视频</Button>
+             <Button variant="outline" size="sm" className="h-8 gap-1 text-emerald-600 border-emerald-200 hover:bg-emerald-50" onClick={() => addFlowItem('audio')}><Mic className="w-4 h-4" /> 语音</Button>
+             <div className="flex-1"></div>
+             <Button variant="ghost" size="sm" className="h-8 gap-1 text-gray-600" onClick={() => setShowSettings(true)}><Settings className="w-4 h-4" /> 延迟设定</Button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/50">
+            {flowItems.length === 0 && <div className="h-full flex flex-col items-center justify-center text-gray-400 border-2 border-dashed border-gray-200 rounded-lg"><p>点击上方按钮添加发送内容</p></div>}
+            {flowItems.map((item, idx) => (
+              <Card key={item.id} className="relative group">
+                <Button variant="ghost" size="icon" className="absolute top-1 right-1 h-6 w-6 text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity" onClick={() => removeFlowItem(item.id)}><Trash2 className="w-3 h-3" /></Button>
+                <CardContent className="p-3">
+                   <div className="flex items-center gap-2 mb-2"><Badge variant="secondary" className="uppercase text-[10px]">{idx + 1}. {item.type}</Badge>{item.path && <span className="text-xs text-emerald-600 truncate max-w-[200px]">✅ {item.path}</span>}</div>
+                   {(item.type === 'text' || item.type === 'image' || item.type === 'video') && <Textarea placeholder={item.type === 'text' ? "输入文字内容... {name}" : "输入配文 (可选)... {name}"} className="min-h-[60px] text-sm resize-y" value={item.content} onChange={(e) => updateFlowItem(item.id, 'content', e.target.value)} />}
+                   {item.type !== 'text' && (
+                     <div className="flex gap-2 mt-2">
+                       <Button variant="secondary" size="sm" className="flex-1 h-7 text-xs" onClick={() => selectFile(item.id, item.type)}>{item.path ? "更换文件" : "选择文件"}</Button>
+                       <Button variant="outline" size="sm" className="h-7 text-xs px-2" disabled={!item.path} onClick={() => handlePreview(item)}><Eye className="w-3 h-3 mr-1"/>预览</Button>
+                     </div>
+                   )}
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="p-4 bg-white border-t shadow-[0_-4px_10px_rgba(0,0,0,0.05)] z-10 flex gap-4">
+        <Button className="flex-1 bg-blue-500 hover:bg-blue-600 text-white font-bold h-12 text-base" onClick={runFilter}>🔍 执行筛选</Button>
+        <Button className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold h-12 text-base disabled:opacity-50 flex flex-col items-center justify-center leading-tight" disabled={selectedJids.size === 0} onClick={startSend}>
+            <span>🚀 发送 ({selectedJids.size}人)</span>
+            <span className="text-[10px] font-normal opacity-80">预计耗时: {etaText}</span>
+        </Button>
+      </div>
+
+      {isSending && (
+        <div className="fixed inset-0 z-50 bg-black/90 flex flex-col items-center justify-center text-white backdrop-blur-sm">
+          <div className="relative w-20 h-20 mb-6"><div className="absolute inset-0 border-4 border-gray-700 rounded-full"></div><div className="absolute inset-0 border-4 border-t-emerald-500 border-r-transparent border-b-transparent border-l-transparent rounded-full animate-spin"></div></div>
+          <div className="text-2xl font-bold mb-2">发送中... {sendProgress.current} / {sendProgress.total}</div>
+          <div className="text-emerald-400 font-mono text-lg mb-4">预计剩余: {(sendProgress.timeLeft / 60).toFixed(1)} 分钟</div>
+          <div className="text-sm text-gray-400">正在发送给: {sendProgress.targetName}</div>
+          <Button variant="destructive" className="mt-10" onClick={() => window.location.reload()}>🛑 强制停止</Button>
+        </div>
+      )}
+
+      {showSettings && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+           <Card className="w-[600px] shadow-2xl animate-in zoom-in-95 duration-200">
+             <div className="p-4 border-b font-bold text-lg flex justify-between"><span>⚙️ 拟人化设置</span><span className="cursor-pointer text-gray-400 hover:text-gray-600" onClick={() => setShowSettings(false)}>✕</span></div>
+             <div className="p-6 space-y-6">
+                {['Type', 'Media', 'Rec', 'Msg'].map(key => {
+                   const kMin = `${key.toLowerCase()}Min`, kMax = `${key.toLowerCase()}Max`
+                   return (<div key={key} className="space-y-2"><div className="flex justify-between text-sm font-medium"><span>{key} 延迟 (秒)</span></div><div className="flex gap-4 items-center"><Input type="number" className="w-20 h-8 font-mono" value={appSettings[kMin]} onChange={e => setAppSettings(p => ({...p, [kMin]: Number(e.target.value)}))} /><Slider className="flex-1 cursor-grab px-2" value={[appSettings[kMin], appSettings[kMax]]} max={10} step={0.1} minStepsBetweenThumbs={0.5} onValueChange={(vals) => setAppSettings(prev => ({ ...prev, [kMin]: vals[0], [kMax]: vals[1] }))} /><Input type="number" className="w-20 h-8 font-mono" value={appSettings[kMax]} onChange={e => setAppSettings(p => ({...p, [kMax]: Number(e.target.value)}))} /></div></div>)
+                })}
+                <div className="space-y-2 pt-4 border-t">
+                  <div className="flex justify-between text-sm font-bold text-blue-600"><span>👤 客户间隔 (User Interval)</span></div>
+                  <div className="flex gap-4 items-center">
+                    <Input type="number" className="w-24 font-bold text-blue-600" value={appSettings.userMin} onChange={e => setAppSettings(p => ({...p, userMin: Number(e.target.value)}))} />
+                    <Slider className="flex-1 px-2" value={[appSettings.userMin, appSettings.userMax]} max={60} step={0.1} onValueChange={(vals) => setAppSettings(prev => ({ ...prev, userMin: vals[0], userMax: vals[1] }))} />
+                    <Input type="number" className="w-24 font-bold text-blue-600" value={appSettings.userMax} onChange={e => setAppSettings(p => ({...p, userMax: Number(e.target.value)}))} />
+                  </div>
+                </div>
+             </div>
+             <div className="p-4 border-t bg-gray-50 flex justify-end"><Button onClick={() => { localStorage.setItem('whapi_settings', JSON.stringify(appSettings)); setShowSettings(false) }}>保存设置</Button></div>
+           </Card>
+        </div>
+      )}
+
+      {/* 全屏管理 (分页版 + 修复间距) */}
+      <Dialog open={showFullContactList} onOpenChange={setShowFullContactList}>
+         <DialogContent className="max-w-[90vw] h-[90vh] flex flex-col">
+            <DialogHeader className="flex-shrink-0 border-b pb-4">
+                <DialogTitle className="flex items-center justify-between">
+                    <span>👥 联系人管理 ({selectedJids.size} / {contacts.length}) - 第 {currentPage} / {totalPages} 页</span>
+                    <div className="flex gap-4 mr-12"> {/* 增加右侧间距，防止误触关闭 */}
+                        <Button variant="outline" size="sm" onClick={() => toggleAllContacts(true)}>全选</Button>
+                        <Button variant="destructive" size="sm" onClick={() => toggleAllContacts(false)}>清空</Button>
+                    </div>
+                </DialogTitle>
+            </DialogHeader>
+            <div className="flex-1 overflow-y-auto">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-2 p-2">
+                    {paginatedContacts.map(c => (
+                        <div key={c.jid} className={`flex items-center p-2 border rounded cursor-pointer ${selectedJids.has(c.jid) ? 'bg-emerald-50 border-emerald-200' : 'hover:bg-gray-50'}`} onClick={() => toggleContact(c.jid)}>
+                            <Checkbox checked={selectedJids.has(c.jid)} />
+                            <div className="ml-2 overflow-hidden">
+                                <div className="font-bold truncate text-sm">{c.name}</div>
+                                <div className="text-xs text-gray-500">{c.phone}</div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+            <div className="pt-4 border-t flex justify-between items-center">
+                <div className="text-sm text-gray-500">每页 {PAGE_SIZE} 条</div>
+                <div className="flex gap-2 items-center">
+                    <Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.max(1, p - 1))} disabled={currentPage === 1}><ChevronLeft className="w-4 h-4"/> 上一页</Button>
+                    <span className="text-sm font-bold">第 {currentPage} 页</span>
+                    <Button variant="outline" size="sm" onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))} disabled={currentPage === totalPages}>下一页 <ChevronRight className="w-4 h-4"/></Button>
+                </div>
+                <Button onClick={() => setShowFullContactList(false)}>完成</Button>
+            </div>
+         </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!previewFile} onOpenChange={() => setPreviewFile(null)}>
+        <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col items-center justify-center bg-black/95 border-none text-white">
+          <DialogTitle className="sr-only">Preview</DialogTitle>
+          <div className="flex-1 w-full h-full flex items-center justify-center p-4">
+            {previewType === 'image' && <img src={previewFile} className="max-w-full max-h-[60vh] object-contain" />}
+            {previewType === 'video' && <video src={previewFile} controls className="max-w-full max-h-[60vh]" />}
+            {previewType === 'audio' && <audio src={previewFile} controls className="w-full" />}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}
+
+export default App
